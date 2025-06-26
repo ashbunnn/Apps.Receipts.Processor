@@ -3,32 +3,32 @@ import {
     IMessage,
     IMessageAttachment,
 } from "@rocket.chat/apps-engine/definition/messages";
-import { getAPIConfig } from "../config/settings";
-import { PromptLibrary } from "../contrib/prompt-library/npm-module";
+import { getAPIConfig, LLMProvider } from "../config/settings";
+import { OCR_SYSTEM_PROMPT, RECEIPT_VALIDATION_PROMPT } from "../const/prompt";
 
 export class ImageHandler {
     constructor(private readonly http: IHttp, private readonly read: IRead) {}
 
     public async processImage(message: IMessage, prompt: string): Promise<any> {
-        const { apiKey, modelType, apiEndpoint } = await getAPIConfig(
+        const { apiKey, modelType, apiEndpoint, provider } = await getAPIConfig(
             this.read
         );
         const base64Image = await this.convertImageToBase64(message);
         const requestBody = this.createOCRRequest(
+            provider,
             modelType,
             prompt,
             base64Image
         );
 
-        return await this.sendRequest(apiEndpoint, apiKey, requestBody);
+        return await this.sendRequest(provider, apiEndpoint, apiKey, requestBody, modelType);
     }
 
     public async validateImage(message: IMessage): Promise<boolean> {
         try {
-            const { modelType } = await getAPIConfig(this.read);
             const response = await this.processImage(
                 message,
-                PromptLibrary.getPrompt(modelType, "RECEIPT_VALIDATION_PROMPT")
+                RECEIPT_VALIDATION_PROMPT
             );
             const jsonResponse = JSON.parse(response);
             return jsonResponse.is_receipt === true;
@@ -54,7 +54,26 @@ export class ImageHandler {
     }
 
     private createOCRRequest(
+        provider: LLMProvider,
         modelType: string,
+        prompt: string,
+        base64Image: string
+    ) {
+        const systemPrompt = OCR_SYSTEM_PROMPT
+        switch (provider) {
+            case LLMProvider.GEMINI:
+                return this.createGeminiRequest(systemPrompt, prompt, base64Image);
+
+            case LLMProvider.OPENAI:
+            case LLMProvider.OTHER:
+            default:
+                return this.createOpenAICompatibleRequest(modelType, systemPrompt, prompt, base64Image);
+        }
+    }
+
+    private createOpenAICompatibleRequest(
+        modelType: string,
+        systemPrompt: string,
         prompt: string,
         base64Image: string
     ) {
@@ -63,10 +82,7 @@ export class ImageHandler {
             messages: [
                 {
                     role: "system",
-                    content: PromptLibrary.getPrompt(
-                        modelType,
-                        "OCR_SYSTEM_PROMPT"
-                    ),
+                    content: systemPrompt,
                 },
                 {
                     role: "user",
@@ -84,26 +100,102 @@ export class ImageHandler {
                     ],
                 },
             ],
+            temperature: 0.1,
+        };
+    }
+
+    private createGeminiRequest(
+        systemPrompt: string,
+        prompt: string,
+        base64Image: string
+    ) {
+        return {
+            systemInstruction: {
+                parts: [{ text: systemPrompt }]
+            },
+            contents: [
+                {
+                    parts: [
+                        {
+                            text: prompt,
+                        },
+                        {
+                            inline_data: {
+                                data: base64Image,
+                                mime_type: "image/jpeg",
+                            },
+                        },
+                    ],
+                },
+            ],
+            generationConfig: {
+                temperature: 0.5,
+            },
         };
     }
 
     private async sendRequest(
+        provider: LLMProvider,
         apiEndpoint: string,
         apiKey: string,
-        requestBody: any
+        requestBody: any,
+        modelType: string
     ) {
-        const response = await this.http.post(apiEndpoint, {
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${apiKey}`,
-            },
+        const headers = this.getRequestHeaders(provider, apiKey);
+        const url = this.getRequestUrl(provider, apiEndpoint, modelType, apiKey);
+
+        const response = await this.http.post(url, {
+            headers,
             data: requestBody,
         });
 
         if (response.statusCode !== 200) {
-            throw new Error(`API error: ${response.statusCode}`);
+            throw new Error(`API error: ${response.statusCode} - ${response.data?.error?.message || 'Unknown error'}`);
         }
 
-        return response.data.choices[0].message.content;
+        return this.extractResponse(provider, response.data);
+    }
+
+    private getRequestHeaders(provider: LLMProvider, apiKey: string) {
+        const baseHeaders = {
+            "Content-Type": "application/json",
+        };
+
+        switch (provider) {
+            case LLMProvider.GEMINI:
+                return baseHeaders;
+
+            case LLMProvider.OPENAI:
+            case LLMProvider.OTHER:
+            default:
+                return {
+                    ...baseHeaders,
+                    "Authorization": `Bearer ${apiKey}`,
+                };
+        }
+    }
+
+     private getRequestUrl(provider: LLMProvider, apiEndpoint: string, modelType: string, apiKey: string): string {
+        switch (provider) {
+            case LLMProvider.GEMINI:
+                return `${apiEndpoint}/${modelType}:generateContent?key=${apiKey}`;
+
+            case LLMProvider.OPENAI:
+            case LLMProvider.OTHER:
+            default:
+                return apiEndpoint;
+        }
+    }
+
+    private extractResponse(provider: LLMProvider, responseData: any): string {
+        switch (provider) {
+            case LLMProvider.GEMINI:
+                return responseData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+            case LLMProvider.OPENAI:
+            case LLMProvider.OTHER:
+            default:
+                return responseData.choices?.[0]?.message?.content || '';
+        }
     }
 }
